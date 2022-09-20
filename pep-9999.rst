@@ -1,0 +1,343 @@
+PEP: 9999
+Title: Separate the the Interpreter API from the C API for Python Extensions Modules
+Author: Tim Felgentreff <tim.felgentreff@oracle.com>
+Sponsor: <real name of sponsor>
+PEP-Delegate: <PEP delegate's real name>
+Discussions-To: <REQUIRED: URL of current canonical discussion thread>
+Status: Draft
+Type: Standards Track
+Content-Type: text/x-rst
+Requires: <pep numbers>
+Created: 18-Aug-2022
+Python-Version: 3.12
+Post-History: <REQUIRED: dates, in dd-mmm-yyyy format, and corresponding links to PEP discussion threads>
+Replaces: <pep number>
+Superseded-By: <pep number>
+Resolution: <url>
+
+
+Abstract
+========
+
+The current stable Python C API and ABI will be deprecated over a sufficiently
+long deprecation period and replaced by an API specifically designed for the
+needs of typical C extension modules. Restrictions on Python core developers to
+change both the API and ABI of the Python interpreter and core modules will be
+lifted incrementally. The separate extension API is designed to remain stable
+and binary compatible for long periods of time, across different CPython
+versions, and even across separate implementations of Python. This allows Python
+implementations to evolve the interpreter and core data structures without
+breaking C extension modules.
+
+Motivation
+==========
+
+A significant part of the current Python ecosystem is based around C extensions
+which make use of parts of the API that the CPython interpreter is written in to
+provide accellerated computation or access to libraries written in C or other
+languages.
+
+The current C API for extensions is specific to the implementation of CPython.
+A subset of the API, the limited API, and a stable ABI exist for the benefit of
+extension developers and to allow Python core developers to easily evolve those
+parts of CPython that are not covered by stable ABI and limited API. However,
+the limited API and stable ABI still expose various implementation details,
+which makes it hard to experiment with new things inside CPython itself: for
+example, using a GC instead of refcounting, tagged pointers, or storage
+strategies for lists and tuples. When CPython wants to change, extensions have
+to adapt. Since these and other implementation details are often different in
+alternative Python implementations (e.g. PyPy, GraalPy, Jython, IronPython,
+etc.), it is also hard for those implementations to support Python C
+extensions. Separating the APIs used to implement CPython from the API intended
+for extension modules can solve these issues.
+
+Over the past three years, we have developed and gained experience with a
+separate API for Python extension modules in the vein of JNI or Lua's C API
+which we call **HPy**. It makes few assumptions about the design decisions of
+any implementation of Python, allowing diverse implementations to support it
+efficiently. This a) makes it possible to compile a single binary which runs
+unmodified on all supported Python implementations and versions now and in the
+future, b) gives a simpler and more manageable API tailored to the needs of
+extension developers and easier to debug for them, and c) it runs at native
+speed on CPython, and can be supported with good speed on alternative
+implementations.
+
+Rationale
+=========
+
+..
+   The stable ABI is holding CPython back, and even the limited API is difficult
+   for alternative implementations to support. At the same time, extension
+   developers need to do work any time the API or ABI changes. The resolution of
+   this conflicting need for Python core developers and Python extension developers
+   is the goal of this proposal.
+
+Just getting rid of the stable ABI without replacement would allow CPython core
+developers to move forward quicker, but is not an option. Even with the stable
+ABI, C extensions still require builds at least for every architecture * OS *
+libc * Python implementation. (For example, the cryptography package[1] provides
+12 binary wheels for CPython with ABI3 alone, plus wheels for PyPy, which does
+not have a stable ABI. A maintainer has stated they would likely delay
+supporting newer versions of CPython altogether if no stable ABI existed[2].)
+Simply removing the stable ABI to enable better CPython evolution would place an
+undue burden on C extension developers. Bindings packages such as Cython or
+pybind11 or those that expose their own C APIs that other packages depend on
+such as NumPy need to be updated before their dependents can be. If no longer
+considered stable, changes to the Python API and ABI, induce accumulating delays
+in updates to those packages.
+
+Other language VMs - such as Lua, Java, or C# - have separated their native
+interface and their implementation details. JNI has not broken backwards
+compatibility since Java 1.2[3]. Other libraries such as the SDL game library
+also support significant evolution of its internals while staying binary
+compatible with closed source applications. This leads us to believe that an
+efficient and binary forward-compatible design is feasible also for Python with
+a dedicated extension API.
+
+..
+   The stability of their native APIs
+   in the face of language evolution leads us to believe that a separate stable API
+   for C extensions is a feasible solution to the aforementioned.
+
+Our experience with HPy, our dedicated API for Python C extensions modules,
+demonstrates that we can offer a stable ABI for C extensions where one binary is
+enough to work across multiple versions and implementations of Python. The "H"
+in "HPy" stands for handle. Handles instead of `PyObject*` pointers are at the
+core of the HPy design. Another core concept is the `HPyContext`, a structure of
+function pointers in the same vein as Java's `JNI` native interface that
+replaces global API functions.
+
+Design Goals
+------------
+
+The design goals for HPy, which we believe should be the goals for any dedicated
+extension API for CPython, are:
+
+- Support the evolution of CPython as well as that of alternative
+  implementations. To that end, the HPy API is designed as to be implementable
+  in an efficient manner on a variety of interpreters. At the same time, no ABI
+  compatibility is required on the part of the interpreters.
+
+- Support different representations of objects (pointer tagging, storage
+  strategies, managed or unmanaged memory, pinned or unpinned), without
+  accidentally leaking their representation to C extensions via C operations. In
+  particular, `HPy` handles are not pointers as `PyObject*` is currently, since
+  that makes it easy to make the mistake of comparing them via `==` in C, a
+  mistake that may not be noticed if the implementation used during development
+  does not have a moving GC. Instead `HPy` is an opaque, pointer sized struct,
+  which gives the same operations after compilation, but does not allow
+  comparison on C.
+
+- Enable moving and generational GC optimizations. Beyond `HPy` handles being
+  structs, they are also short lived and may be invalidated by the runtime
+  outside of a downcall. Long lived handles need to be stored in `HPyField` if
+  they are part of a C structure so they can be marked reachable from another
+  object (which may be in another GC generation, for example). Global references
+  can be replaced with `HPyGlobal` for simple migration, or stored in also as
+  `HPyField` via the PEP-3121 module state. Both of these types can be converted
+  to short-lived handles via an API call, thus allowing the runtime to trace and
+  move such references.
+
+- Provide single binary for all Python implementations and future versions. This
+  is achieved via the indirection through the `HPyContext`, a struct that gives
+  access to API functions and well-known objects. While the table layout is
+  fixed, each interpreter can easily their own implementation of the context to
+  tie into the interpreter API. As the API evolves, members can be added at the
+  end, naturally keeping binary compatibility with prior versions. To support
+  the case where members are re-ordered or removed, the existing module
+  initialization is extended to first call an extension module provided function
+  to request the version of HPy the extension was compiled against. The runtime
+  can then provide an `HPyContext` compatible with the layout of that
+  version. However, as the interpreters evolve, performance properties of API
+  functions cannot be guaranteed as well as they currently are, as they may be
+  more or less difficult to implement.
+
+- Cater to the debugging needs of extension developers. The `HPyContext` table
+  design makes it easy to wrap the entire API surface, and provide, for example,
+  a "debug context" with additional assertions and checks that help the
+  extension developers, all without having to recompile the extension.
+
+- Make incremental porting of extensions possible. An additional argument of
+  `HPyContext` is added to all API functions. But our experience with HPy so far
+  leads us to believe that the API can stay close in naming and concepts to the
+  current API. Where there aren't strong reasons against it, porting thus
+  becomes little more than search and replace. Due to the closeness of the HPy
+  API to the current API, we can also easily call from one to another. A module
+  can use "legacy" and HPy code in the same extension, and thus incrementally
+  port to HPy. The benefit of binary compatibility across Python implementations
+  can only be gained when the full port is finished, however.
+
+- Multiple interpreters in the same process ("subinterpreters") should be made
+  easier. Any Python objects' global state must be registered and stored as
+  `HPyGlobal` or in the module state via `HPyField`, which leaves native global
+  state as the only remaining obstacle to full subinterpreter support.
+
+- Performance should not be compromised. Multiple current extension modules,
+  like Cython and NumPy, do not use the Python limited API. Cython can be
+  configured to do so, but it does not default to it, citing performance as a
+  primary reason for using internal APIs [CITATION NEEDED]. To cater to those
+  extensions that do not necessarily desire binary compatibility across
+  versions, HPy provides multiple compilation modes. The default "universal"
+  mode brings the aforementioned benefits like binary portability, but an
+  additional "CPython ABI" mode gives performance equivalent to using the Python
+  API directly, at the cost of only running against a specific version of
+  CPython. [BENCHMARKS NEEDED]
+
+Non-Goals
+---------
+
+There are certain kinds of extensions that we do not feel able to support with
+such a new API. Among them are certain debugging, profiling, or introspection
+APIs that have as their "raison d'être" to expose CPython implementation details
+for developers.
+
+..
+   - many C extensions
+   - multiple versions supported
+   - binary wheels provided for different versions
+   - stable ABI is useful, but still a lot of wheels needed
+     - e.g. cryptography has 11 binary wheels for abi3, would need 66 without stable abi
+   - stable abi is directly intertwined with python core development
+     - either core cannot move forward, or package maintainers need to build more
+       wheels / support fewer versions
+   - separating the cpython interpreter api from the c extension api will allow best of both
+     - move forward within cpython without having to keep binary compat
+     - keep a stable binary interface for C extensions
+
+   from discussions:
+
+   https://github.com/markshannon/New-C-API-for-Python/issues
+   - especially https://github.com/markshannon/New-C-API-for-Python/issues/8
+
+   - we have implemented HPy for CPython, PyPy, and GraalPy
+   - we have partially or completely ported multiple complex extensions to HPy:
+     ujson, Pillow, NumPy, Matplotlib, Kiwisolver, Cython
+
+   - we want to support the evolution of Python as well as alternative
+     implementations and their optimizations
+
+     - support different representations of objects (pointer tagging, storage
+       strategies) => opaque handles instead of pointers to structs
+
+     - support moving GCs => handles are structs, structs cannot be compared with
+       ==, so they don't accidentally leak moving vs non-moving GCs; handles are
+       short lived, long lived handles need to be stored in HPyField or HPyGlobal
+
+     - single binary for all pythons => function table (see SDL2), so that
+       implementations can evolve how APIs are implemented, add APIs, and provide
+       different API versions at the same time to different extensions, all without
+       breaking binary compatibility
+
+     - easier debugging => the function table design also allows "debug context"
+       with additional assertions and checks that help the extension developers
+
+     - incremental porting of extensions possible => keep the API and concepts
+       close to the current API where there aren't strong reasons against it, so
+       that we can over API to have "legacy" and "hpy" code mix in the same
+       extension
+
+     - subinterpreters should be directly possible => any global state must be
+       registered and stored as HPyGlobals
+
+   - we want to not force compromise on CPython performance
+     - ABI-mode compilation where a binary is compiled to CPython API, loosing it's
+       portability benefit (only works on the one CPython version), but gives
+       higher performance (BENCHMARKS!!!)
+
+   - we do not want to support extensions that have the explicit goal to expose
+     Python implementation semantics (e.g. debuggers or other tooling that wants to
+     expose refcounts, internal state, etc)
+
+
+Specification
+=============
+
+[Describe the syntax and semantics of any new language feature.]
+
+Backwards Compatibility
+=======================
+
+There is no backwards compatibility, only the question of deprecation
+period. The deprecation of the limited API and stable ABI would have to be done
+over multiple years. In [4], Mark Shannon proposed a timeline in which, by 2031,
+the legacy C API and stable ABI would be finally marked as unstable. At this
+point, only the new extension API would guarantee binary compatibility across
+more than one Python version. The actual stability of the current ABI and API
+may be longer, only the guarantee of stability would cease.
+
+Thus, by this point all extensions must be ported. The incremental porting that
+HPy allows would hopefully enable extension authors to spread this work out over
+multiple years, and even accept multiple small contributions that port single
+functions or data structures at a time.
+
+From our experience with porting (so far) ujson, Pillow, NumPy, Kiwisolver, and
+Matplotlib, there are multiple more difficult steps for extension authors that
+are less easy to split up into smaller chunks of work:
+
+- Move to the current limited API, including using heap types and not relying on
+  direct access to any CPython structures.
+- Update all global state to use module state and `HPyField` or `HPyGlobal`.
+- Update all current native data structures that hold on to long lived
+  `PyObject*` to use `HPyField` instead.
+- Migrate or extend any C API the extension itself exposes to HPy.
+
+Once these are complete, moving extension methods to HPy can be done one method
+at a time, and is thus much easier.
+
+Security Implications
+=====================
+
+
+How to Teach This
+=================
+
+- documentation for C API needs to be updated so that new extension developers
+  can get started on HPy directly
+- migration document, we've done it for HPy
+
+
+Reference Implementation
+========================
+
+- we have implemented HPy for CPython, PyPy, and GraalPy
+- we have partially or completely ported multiple complex extensions to HPy:
+  ujson, Pillow, NumPy, Matplotlib, Kiwisolver, Cython
+
+hpyproject.org/
+- https://github.com/hpyproject/hpy
+- https://github.com/hpyproject/numpy-hpy
+- https://github.com/hpyproject/kiwisolver-hpy
+- https://github.com/hpyproject/ujson-hpy
+- https://github.com/hpyproject/matplotlib-hpy
+- https://github.com/hpyproject/Pillow-hpy
+
+[Link to any existing implementation and details about its state, e.g. proof-of-concept.]
+
+
+Rejected Ideas
+==============
+
+[Why certain ideas that were brought while discussing this PEP were not ultimately pursued.]
+
+
+Open Issues
+===========
+
+[Any points that are still being decided/discussed.]
+
+
+Footnotes
+=========
+
+[A collection of footnotes cited in the PEP, and a place to list non-inline hyperlink targets.]
+
+[1] https://pypi.org/project/cryptography/#files
+[2] https://discuss.python.org/t/lets-get-rid-of-the-stable-abi-but-keep-the-limited-api/18458/10
+[3] The Java™ Native Interface: Programmer’s Guide and Specification. Chapter 1 - Evolution of the JNI.
+[4] https://github.com/markshannon/New-C-API-for-Python
+
+Copyright
+=========
+
+This document is placed in the public domain or under the
+CC0-1.0-Universal license, whichever is more permissive.
